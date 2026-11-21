@@ -9,6 +9,7 @@ bytes = "1.12.2"
 hashbrown = "0.17.1"
 memchr = "2.8.3"
 memmap2 = "0.9.12"
+mimalloc = "0.1.52"
 parquet = { version = "60.1.0", default-features = false }
 rayon = "1.12.0"
 
