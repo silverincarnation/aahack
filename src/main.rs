@@ -16,6 +16,9 @@
 
 mod general;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -947,7 +950,7 @@ fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
 
 // DIAGNOSTIC BUILD: after the output is written, sleep so that the scored
 // runtime encodes facts about the scoring machine. 1 = internal time, 2 = machine.
-const DIAG: u8 = 0;
+const DIAG: u8 = 5;
 
 static mut DIAG_TOUCH: f64 = 0.0;
 static mut DIAG_PARSED: f64 = 0.0;
@@ -1048,6 +1051,34 @@ fn diag_sleep(general_path: bool) {
             let q1 = (p / 0.5).round().min(12.0);
             let q2 = ((t - p).max(0.0) / 0.5).round().min(12.0);
             13.0 * q1 + q2 + 100.0 * diag_weird()
+        }
+        5 => {
+            let fault = |huge: bool| -> f64 {
+                let n = rayon::current_num_threads().max(1);
+                let per = (2usize << 30) / n;
+                let t = Instant::now();
+                rayon::broadcast(|_| {
+                    let mut m = memmap2::MmapMut::map_anon(per).expect("map_anon");
+                    if huge {
+                        let _ = m.advise(memmap2::Advice::HugePage);
+                    } else {
+                        let _ = m.advise(memmap2::Advice::NoHugePage);
+                    }
+                    let mut i = 0;
+                    while i < per {
+                        m[i] = 1;
+                        i += 4096;
+                    }
+                    std::hint::black_box(&m);
+                });
+                t.elapsed().as_secs_f64()
+            };
+            let a = fault(false);
+            let b = fault(true);
+            log(&format!("diag5 fault 4k {a:.3} thp {b:.3}"));
+            let qa = (a / 0.25).round().min(8.0);
+            let qb = (b / 0.25).round().min(9.0);
+            30.0 * qa + 3.0 * qb
         }
         _ => 0.0,
     };
