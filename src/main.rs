@@ -778,20 +778,38 @@ fn build_names(chs: &[S]) -> Names {
     log("links: uf");
     // Name = byte-wise smallest ID of the component. Codes of generator-shaped IDs sort
     // like their bytes; only interned IDs need a byte comparison.
-    let mut best: Vec<u64> = vec![EMPTY; cap];
-    let mut n = 0usize;
-    for g in 0..cap {
+    // Roots without mutation, in parallel (unions keep paths short).
+    let root: Vec<u32> = (0..cap as u32)
+        .into_par_iter()
+        .map(|g| {
+            let mut x = g;
+            while parent[x as usize] != x {
+                x = parent[x as usize];
+            }
+            x
+        })
+        .collect();
+    let n = keys.par_iter().filter(|&&k| k != EMPTY).count();
+    // Code order is byte order among generator-shaped codes: a parallel atomic minimum per
+    // root, then the (few) interned IDs compared by bytes.
+    let b: Vec<AtomicU64> = (0..cap).into_par_iter().map(|_| AtomicU64::new(u64::MAX)).collect();
+    (0..cap).into_par_iter().for_each(|g| {
         let k = keys[g];
-        if k == EMPTY {
-            continue;
+        if k != EMPTY && k & TAG != 0 {
+            b[root[g] as usize].fetch_min(k, Ordering::Relaxed);
         }
-        n += 1;
-        let r = find(&mut parent, g as u32) as usize;
-        parent[g] = r as u32;
-        if best[r] == EMPTY || cmp_ids(k, best[r]) == std::cmp::Ordering::Less {
+    });
+    let mut best: Vec<u64> = b.into_iter().map(|a| a.into_inner()).collect();
+    let interned: Vec<usize> = (0..cap).into_par_iter().filter(|&g| keys[g] != EMPTY && keys[g] & TAG == 0).collect();
+    for g in interned {
+        let k = keys[g];
+        let r = root[g] as usize;
+        if best[r] == u64::MAX || cmp_ids(k, best[r]) == std::cmp::Ordering::Less {
             best[r] = k;
         }
     }
+    parent = root;
+    log("links: best");
     let fbits = (n * 16).next_power_of_two().max(64);
     let fmask = fbits - 1;
     let filt: Vec<AtomicU64> = (0..fbits / 64).into_par_iter().map(|_| AtomicU64::new(0)).collect();
@@ -850,6 +868,23 @@ impl<T: Copy, const B: usize> Wc<T, B> {
         }
         self.parts
     }
+}
+
+/// Runs `work(acc, i)` for i in 0..n on every pool thread, each claiming the next index,
+/// with one accumulator per thread.
+fn par_claim<A: Send>(n: usize, init: impl Fn() -> A + Sync, work: impl Fn(&mut A, usize) + Sync) -> Vec<A> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    rayon::broadcast(|_| {
+        let mut a = init();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            work(&mut a, i);
+        }
+        a
+    })
 }
 
 fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
@@ -967,16 +1002,15 @@ fn fast() -> bool {
 
 
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.len()).sum();
-    let nfold = (ev_chunks.len() / general::min_len(ev_chunks.len())).max(1);
+    let nfold = rayon::current_num_threads().max(1);
     let ev_cap = ev_bytes / 80 / nfold / NP1 * 5 / 4 + 16;
     // Events: every copy, scattered by hash(event_id).
     let parse_events = || -> Vec<Vec<Vec<Ev>>> {
-    let r = ev_chunks
-        .par_iter()
-        .with_min_len(general::min_len(ev_chunks.len()))
-        .fold(
-            || Wc::<Ev, 4>::new(NP1, ev_cap),
-            |mut acc, &ch| {
+    let r: Vec<Vec<Vec<Ev>>> = par_claim(
+        ev_chunks.len(),
+        || Wc::<Ev, 4>::new(NP1, ev_cap),
+        |acc, ci| {
+                let ch = ev_chunks[ci];
                 scan::<7>(ch, |f| {
                     let eid = f[0];
                     if eid.is_empty() {
@@ -1013,22 +1047,21 @@ fn fast() -> bool {
                     };
                     acc.push((h64(k) >> 54) as usize % NP1, e);
                 });
-                acc
-            },
-        )
-        .map(|w| w.finish())
-        .collect();
+        },
+    )
+    .into_iter()
+    .map(|w| w.finish())
+    .collect();
     log("events parsed");
     r
     };
 
     let parse_clicks = |names: &Names| -> Vec<Vec<Vec<PCl>>> {
-    let r = cl_chunks
-        .par_iter()
-        .with_min_len(general::min_len(cl_chunks.len()))
-        .fold(
+    let r: Vec<Vec<Vec<PCl>>> = par_claim(
+            cl_chunks.len(),
             || Wc::<PCl, 8>::new(NP2, 0),
-            |mut acc, &ch| {
+            |acc, ci| {
+                let ch = cl_chunks[ci];
                 // Ring of clicks waiting for their person lookup, so the table line is
                 // prefetched a few clicks ahead.
                 const R: usize = 16;
@@ -1058,17 +1091,17 @@ fn fast() -> bool {
                     names.prefetch(u);
                     let slot = &mut ring[rn % R];
                     if rn >= R {
-                        emit(&mut acc, *slot);
+                        emit(acc, *slot);
                     }
                     *slot = PCl { person: u, cid: code(cid), ts: (ts - lo_click) as u32, camp: c };
                     rn += 1;
                 });
                 for k in rn.saturating_sub(R)..rn {
-                    emit(&mut acc, ring[k % R]);
+                    emit(acc, ring[k % R]);
                 }
-                acc
             },
         )
+        .into_iter()
         .map(|w| w.finish()).collect();
     log("clicks parsed");
     r
@@ -1080,31 +1113,31 @@ fn fast() -> bool {
         return false;
     }
     // Dedup per partition; survivors scattered by hash(person).
-    let pev_parts: Vec<Vec<Vec<PEv>>> = (0..NP1)
-        .into_par_iter()
-        .with_min_len(NP1 / (rayon::current_num_threads() * 4).max(1))
-        .fold(
-            || split_into::<PEv>(NP2),
-            |mut acc, p| {
+    let pev_parts: Vec<Vec<Vec<PEv>>> = par_claim(
+            NP1,
+            || (split_into::<PEv>(NP2), Vec::<u32>::new(), Vec::<&Ev>::new()),
+            |st, p| {
+                let (acc, slot, best) = st;
                 let total: usize = ev_parts.iter().map(|t| t[p].len()).sum();
                 let cap = (total * 2).next_power_of_two().max(16);
                 let mask = cap - 1;
-                let mut slot: Vec<u32> = vec![u32::MAX; cap];
-                let mut best: Vec<Ev> = Vec::with_capacity(total);
+                slot.clear();
+                slot.resize(cap, u32::MAX);
+                best.clear();
                 for t in &ev_parts {
                     for e in &t[p] {
                         let mut i = (h64(e.eid) as usize) & mask;
                         loop {
-                            let s = slot[i];
+                            let s = unsafe { *slot.get_unchecked(i) };
                             if s == u32::MAX {
                                 slot[i] = best.len() as u32;
-                                best.push(*e);
+                                best.push(e);
                                 break;
                             }
                             let b = &mut best[s as usize];
                             if b.eid == e.eid {
                                 if e.ingest < b.ingest {
-                                    *b = *e;
+                                    *b = e;
                                 }
                                 break;
                             }
@@ -1113,19 +1146,21 @@ fn fast() -> bool {
                     }
                 }
                 const PF: usize = 16;
-                for (j, e) in best.iter().enumerate() {
+                for j in 0..best.len() {
                     if let Some(f) = best.get(j + PF) {
                         names.prefetch(f.user);
                     }
+                    let e = best[j];
                     if e.pc >> 31 == 0 {
                         continue;
                     }
                     let person = names.get(e.user);
                     acc[(h64(person) >> 54) as usize % NP2].push(PEv { person, ts: e.ts, pc: e.pc & 0x7fff_ffff });
                 }
-                acc
             },
         )
+        .into_iter()
+        .map(|x| x.0)
         .collect();
     drop(ev_parts);
     log("events deduped");
@@ -1136,16 +1171,15 @@ fn fast() -> bool {
     let ncell = ncamp * nd;
     let shift = (ws - lo_click) as u32; // event ts -> click ts scale
     type Acc = (Vec<URow>, Vec<[i64; 4]>, Vec<u32>, Vec<u32>, Vec<u32>);
-    let (urows, cacc) = (0..NP2)
-        .into_par_iter()
-        .with_min_len(NP2 / (rayon::current_num_threads() * 4).max(1))
-        .fold(
+    let (urows, cacc) = par_claim(
+            NP2,
             || -> Acc { (Vec::new(), vec![[0i64; 4]; ncell], vec![0u32; ncamp], Vec::new(), vec![0u32; ncamp]) },
-            |(mut urows, mut ca, mut cnt, mut active, mut pos): Acc, b| {
+            |st: &mut Acc, b| {
+                let (urows, ca, cnt, active, pos) = st;
                 let tq = Instant::now();
                 let ne: usize = pev_parts.iter().map(|t| t[b].len()).sum();
                 if ne == 0 {
-                    return (urows, ca, cnt, active, pos);
+                    return;
                 }
                 // Group by person through a small local table (dense local ids), then sort
                 // each person's events by ts.
@@ -1286,7 +1320,7 @@ fn fast() -> bool {
                         let sday = start.div_euclid(DAY);
                         if sday != cur_day {
                             if cur_day != i64::MIN {
-                                flush(&mut urows, cur_day, us, ue, ur, &catsum);
+                                flush(urows, cur_day, us, ue, ur, &catsum);
                             }
                             cur_day = sday;
                             us = 0;
@@ -1354,25 +1388,25 @@ fn fast() -> bool {
                         if rev > 0 {
                             cell[1] += 1;
                         }
-                        for &c in &active {
+                        for &c in active.iter() {
                             ca[c as usize * nd + di][3] += 1;
                         }
                         i = k;
                     }
                     if cur_day != i64::MIN {
-                        flush(&mut urows, cur_day, us, ue, ur, &catsum);
+                        flush(urows, cur_day, us, ue, ur, &catsum);
                     }
                     for k in lo..hi {
                         cnt[pc[k].camp as usize] = 0;
                     }
                     active.clear();
                 }
-                (urows, ca, cnt, active, pos)
             },
         )
+        .into_iter()
         .map(|(u, c, _, _, _)| (u, c))
-        .reduce(
-            || (Vec::new(), vec![[0i64; 4]; ncell]),
+        .fold(
+            (Vec::new(), vec![[0i64; 4]; ncell]),
             |mut a, b| {
                 if a.0.len() < b.0.len() {
                     let mut b0 = b.0;
