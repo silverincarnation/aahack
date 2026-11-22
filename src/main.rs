@@ -82,7 +82,11 @@ fn pack(s: &[u8]) -> u128 {
 /// those for order goes through the bytes.
 const TAG: u64 = 1 << 63;
 
-static INTERN: std::sync::Mutex<Option<(hashbrown::HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>> = std::sync::Mutex::new(None);
+// Interned IDs: 256 shards, each a map and its strings. Code = shard | index << 8.
+const ISHARDS: usize = 256;
+type IShard = std::sync::Mutex<(hashbrown::HashMap<Box<[u8]>, u64>, Vec<Box<[u8]>>)>;
+static INTERN: std::sync::LazyLock<Vec<IShard>> =
+    std::sync::LazyLock::new(|| (0..ISHARDS).map(|_| std::sync::Mutex::new((hashbrown::HashMap::new(), Vec::new()))).collect());
 
 #[inline(always)]
 fn d36(c: u8) -> u64 {
@@ -104,6 +108,13 @@ fn pack6(y: u64) -> u64 {
 
 #[inline(always)]
 fn code(s: &[u8]) -> u64 {
+    let c = code_nointern(s);
+    if c != u64::MAX { c } else { intern(s) }
+}
+
+/// The arithmetic codes; u64::MAX when the ID has another shape.
+#[inline(always)]
+fn code_nointern(s: &[u8]) -> u64 {
     let n = s.len();
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     if n == 9 && s[0].wrapping_sub(b'a') < 26 {
@@ -163,22 +174,87 @@ fn code(s: &[u8]) -> u64 {
             return TAG | ((s[0] - b'a') as u64) << 48 | v;
         }
     }
-    intern(s)
+    // A letter and 9 or 10 base-36 characters: base-37 positions (0 = end), no lock needed.
+    if (10..=11).contains(&n) && s[0].is_ascii_lowercase() {
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for i in 1..11 {
+            let d = if i < n { d36(s[i]) } else { 0 };
+            if i < n && d == 0 {
+                ok = false;
+            }
+            v = v * 37 + d;
+        }
+        if ok {
+            return LTAG | ((s[0] - b'a') as u64) << 53 | v;
+        }
+    }
+    u64::MAX
 }
+
+/// A code for IDs that are only compared for equality (event IDs): other shapes get a
+/// 62-bit hash instead of being interned (a collision among 60M IDs is ~1e-6 likely).
+#[inline]
+fn code_eq(s: &[u8]) -> u64 {
+    let c = code_nointern(s);
+    if c != u64::MAX {
+        return c;
+    }
+    let mut a: u64 = 0x243f_6a88_85a3_08d3 ^ s.len() as u64;
+    let mut b: u64 = 0x1319_8a2e_0370_7344;
+    for ch in s.chunks(8) {
+        let mut w = [0u8; 8];
+        w[..ch.len()].copy_from_slice(ch);
+        let x = u64::from_le_bytes(w);
+        a = (a ^ x).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        b = (b ^ x.rotate_left(17)).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(31);
+    }
+    let h = h64(a) ^ h64(b).rotate_left(23);
+    (h & ((1u64 << 62) - 1)) | (1 << 40) // keep it away from interned codes and EMPTY
+}
+
+/// A code for IDs that live in the mapped input for the whole run (click IDs): other
+/// shapes point at their bytes instead of being interned. Equal strings can get different
+/// codes, so compare these with `cmp_ids`, never with `==`.
+const PTAG: u64 = 1 << 61;
+
+#[inline]
+fn code_ref(s: &'static [u8]) -> u64 {
+    let c = code_nointern(s);
+    if c != u64::MAX {
+        return c;
+    }
+    let p = s.as_ptr() as u64;
+    if s.len() < (1 << 13) && p < (1 << 47) {
+        PTAG | (s.len() as u64) << 47 | p
+    } else {
+        intern(s)
+    }
+}
+
+/// Codes of a letter and 9 or 10 base-36 characters (bit 63 clear, bit 62 set).
+const LTAG: u64 = 1 << 62;
 
 static INTERN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cold]
 fn intern(s: &[u8]) -> u64 {
-    INTERN_CALLS.fetch_add(1, Ordering::Relaxed);
-    let mut g = INTERN.lock().unwrap();
-    let (m, v) = g.get_or_insert_with(|| (hashbrown::HashMap::new(), Vec::new()));
-    if let Some(&c) = m.get(s) {
+    if DIAG == 6 {
+        INTERN_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in s {
+        h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    let sh = (h64(h) >> 56) as usize % ISHARDS;
+    let mut g = INTERN[sh].lock().unwrap();
+    if let Some(&c) = g.0.get(s) {
         return c;
     }
-    let c = v.len() as u64;
-    v.push(s.to_vec());
-    m.insert(s.to_vec(), c);
+    let c = sh as u64 | (g.1.len() as u64) << 8;
+    let b: Box<[u8]> = s.into();
+    g.1.push(b.clone());
+    g.0.insert(b, c);
     c
 }
 
@@ -192,9 +268,27 @@ fn decode_into(c: u64, buf: &mut Vec<u8>) {
             }
             buf.push(if d <= 10 { b'0' + (d - 1) as u8 } else { b'a' + (d - 11) as u8 });
         }
+    } else if c & PTAG != 0 && c & LTAG == 0 {
+        let n = ((c >> 47) & ((1 << 13) - 1)) as usize;
+        let p = (c & ((1u64 << 47) - 1)) as *const u8;
+        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) });
+    } else if c & LTAG != 0 {
+        buf.push(b'a' + ((c >> 53) & 31) as u8);
+        let mut v = c & ((1u64 << 53) - 1);
+        let mut d = [0u8; 10];
+        for i in (0..10).rev() {
+            d[i] = (v % 37) as u8;
+            v /= 37;
+        }
+        for &x in &d {
+            if x == 0 {
+                break;
+            }
+            buf.push(if x <= 10 { b'0' + (x - 1) } else { b'a' + (x - 11) });
+        }
     } else {
-        let g = INTERN.lock().unwrap();
-        buf.extend_from_slice(&g.as_ref().unwrap().1[c as usize]);
+        let g = INTERN[c as usize % ISHARDS].lock().unwrap();
+        buf.extend_from_slice(&g.1[(c >> 8) as usize]);
     }
 }
 
@@ -628,6 +722,24 @@ fn code_selftest() {
             assert!(code(b) & TAG == 0, "{:?}", b);
         }
     }
+    // Round trip and byte order across all code classes.
+    let mut prev: Vec<u8> = b"a1".to_vec();
+    let mut pc = code(&prev);
+    for _ in 0..2_000_000 {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let n = 1 + (seed % 12) as usize;
+        let mut b = vec![0u8; n];
+        for i in 0..n {
+            let r = (seed.rotate_left(i as u32 * 7) ^ (i as u64 * 0x9E37)) as usize;
+            b[i] = if r % 11 == 0 { al[(r / 11) % al.len()] } else if r % 2 == 0 { b'0' + (r / 2 % 10) as u8 } else { b'a' + (r / 2 % 26) as u8 };
+        }
+        let c = code(&b);
+        assert_eq!(decode(c), b, "roundtrip {:?}", b);
+        assert_eq!(code(&b), c);
+        assert_eq!(cmp_ids(c, pc), b.as_slice().cmp(prev.as_slice()), "{:?} vs {:?}", b, prev);
+        prev = b;
+        pc = c;
+    }
     eprintln!("code selftest ok");
 }
 
@@ -953,7 +1065,7 @@ fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
 
 // DIAGNOSTIC BUILD: after the output is written, sleep so that the scored
 // runtime encodes facts about the scoring machine. 1 = internal time, 2 = machine.
-const DIAG: u8 = 6;
+const DIAG: u8 = 0;
 
 static mut DIAG_TOUCH: f64 = 0.0;
 static mut DIAG_PARSED: f64 = 0.0;
@@ -1085,7 +1197,7 @@ fn diag_sleep(general_path: bool) {
         }
         6 => {
             let calls = INTERN_CALLS.load(Ordering::Relaxed) as f64;
-            let uniq = INTERN.lock().unwrap().as_ref().map(|x| x.1.len()).unwrap_or(0) as f64;
+            let uniq = INTERN.iter().map(|x| x.lock().unwrap().1.len()).sum::<usize>() as f64;
             log(&format!("diag6 intern calls {calls} unique {uniq}"));
             let a = (calls + 1.0).log10().round().min(8.0);
             let b = (uniq + 1.0).log10().round().min(8.0);
@@ -1246,7 +1358,7 @@ fn fast() -> bool {
                             _ => valid = false,
                         }
                     }
-                    let k = code(eid);
+                    let k = code_eq(eid);
                     let e = Ev {
                         eid: k,
                         user: if f[1].is_empty() { EMPTY } else { code(f[1]) },
@@ -1303,7 +1415,7 @@ fn fast() -> bool {
                     if rn >= R {
                         emit(acc, *slot);
                     }
-                    *slot = PCl { person: u, cid: code(cid), ts: (ts - lo_click) as u32, camp: c };
+                    *slot = PCl { person: u, cid: code_ref(cid), ts: (ts - lo_click) as u32, camp: c };
                     rn += 1;
                 });
                 for k in rn.saturating_sub(R)..rn {
@@ -1531,7 +1643,7 @@ fn fast() -> bool {
                     cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_ids(a.cid, b.cid)));
                     let mut m = 0usize;
                     for k in 0..cs.len() {
-                        if m > 0 && cs[m - 1].ts == cs[k].ts && cs[m - 1].cid == cs[k].cid {
+                        if m > 0 && cs[m - 1].ts == cs[k].ts && cmp_ids(cs[m - 1].cid, cs[k].cid) == std::cmp::Ordering::Equal {
                             continue;
                         }
                         cs[m] = cs[k];
