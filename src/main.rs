@@ -949,7 +949,7 @@ fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
 
 // DIAGNOSTIC BUILD: after the output is written, sleep so that the scored
 // runtime encodes facts about the scoring machine. 1 = internal time, 2 = machine.
-const DIAG: u8 = 0;
+const DIAG: u8 = 2;
 
 fn diag_sleep(general_path: bool) {
     let secs = match DIAG {
