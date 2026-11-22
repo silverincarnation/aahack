@@ -584,14 +584,20 @@ pub mod out {
     }
 
     pub fn write(path: &str, schema: &str, cols: Vec<Col>) {
+        write_dict(path, schema, cols, &[])
+    }
+
+    /// Like `write`, with dictionary encoding for the named columns.
+    pub fn write_dict(path: &str, schema: &str, cols: Vec<Col>, dict: &[&str]) {
         let schema = Arc::new(parse_message_type(schema).unwrap());
-        let props = Arc::new(
-            WriterProperties::builder()
-                .set_compression(Compression::UNCOMPRESSED)
-                .set_dictionary_enabled(false)
-                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-                .build(),
-        );
+        let mut b = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None);
+        for &c in dict {
+            b = b.set_column_dictionary_enabled(parquet::schema::types::ColumnPath::from(c), true);
+        }
+        let props = Arc::new(b.build());
         let f = File::create(path).unwrap();
         let mut w = SerializedFileWriter::new(f, schema, props).unwrap();
         let mut rg = w.next_row_group().unwrap();

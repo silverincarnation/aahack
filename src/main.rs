@@ -115,6 +115,30 @@ fn code(s: &[u8]) -> u64 {
             }
         }
     }
+    // 2 to 8 bytes: read the 8 bytes ending at the ID's end. Every caller passes a field of
+    // a mapped file whose header line precedes it, so the up to 6 bytes before are readable.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse2"))]
+    if n >= 2 && n <= 8 && s[0].wrapping_sub(b'a') < 26 {
+        unsafe {
+            use std::arch::x86_64::*;
+            let x = std::ptr::read_unaligned(s.as_ptr().add(n).sub(8) as *const u64);
+            let v = _mm_cvtsi64_si128(x as i64);
+            let dig = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x2f)), _mm_cmplt_epi8(v, _mm_set1_epi8(0x3a)));
+            let low = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)), _mm_cmplt_epi8(v, _mm_set1_epi8(0x7b)));
+            let junk = 9 - n; // low bytes that are not digits of this ID
+            let need = (0xffu32 << junk) & 0xff;
+            let ok = _mm_movemask_epi8(_mm_or_si128(dig, low)) as u32 & need;
+            if ok == need {
+                let val = _mm_or_si128(
+                    _mm_and_si128(dig, _mm_sub_epi8(v, _mm_set1_epi8(0x2f))),
+                    _mm_and_si128(low, _mm_sub_epi8(v, _mm_set1_epi8(0x56))),
+                );
+                let y = ((_mm_cvtsi128_si64(val) as u64) & (u64::MAX << (8 * junk))).swap_bytes();
+                let p = _pext_u64(y, 0x3f3f_3f3f_3f3f_3f3f);
+                return TAG | ((s[0] - b'a') as u64) << 48 | (p << (6 * junk));
+            }
+        }
+    }
     if (2..=9).contains(&n) && s[0].is_ascii_lowercase() {
         let mut v: u64 = 0;
         let mut ok = true;
@@ -321,13 +345,17 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
         } else {
             let mut w = 0u32;
             for i in 0..N {
-                let mut v = unsafe { chunk.get_unchecked(st..ends[i]) };
-                if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
-                    v = &v[1..v.len() - 1];
-                    w += 2;
-                }
-                fields[i] = v;
-                st = ends[i] + 1;
+                let e = ends[i];
+                let len = e - st;
+                // Wrapped: at least 2 bytes, first and last a quote. Both reads are in the
+                // chunk; for a short field they read a neighbour and `len >= 2` rejects it.
+                let first = unsafe { *chunk.get_unchecked(st.min(chunk.len() - 1)) };
+                let last = unsafe { *chunk.get_unchecked(e.max(1) - 1) };
+                let wr = (len >= 2) & (first == b'"') & (last == b'"');
+                let k = wr as usize;
+                fields[i] = unsafe { chunk.get_unchecked(st + k..e - k) };
+                w += 2 * wr as u32;
+                st = e + 1;
             }
             if w != quotes {
                 return;
@@ -568,6 +596,23 @@ fn code_selftest() {
             assert_eq!(code(&b), want, "{:?}", b);
         } else {
             assert!(code(&b) & TAG == 0, "{:?}", b);
+        }
+    }
+    // Shorter IDs, read in place with readable bytes before them.
+    let mut buf = vec![b'x'; 64];
+    for _ in 0..3_000_000 {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let n = 1 + (seed % 9) as usize;
+        for i in 0..16 {
+            let r = (seed.rotate_left(i as u32 * 5) ^ (i as u64 * 0x9E37)) as usize;
+            buf[16 + i] = if r % 7 == 0 { al[(r / 7) % al.len()] } else if r % 2 == 0 { b'0' + (r / 2 % 10) as u8 } else { b'a' + (r / 2 % 26) as u8 };
+        }
+        let b = &buf[16..16 + n];
+        let want = code_slow(b);
+        if want != u64::MAX {
+            assert_eq!(code(b), want, "{:?}", b);
+        } else {
+            assert!(code(b) & TAG == 0, "{:?}", b);
         }
     }
     eprintln!("code selftest ok");
@@ -1469,8 +1514,12 @@ fn fast() -> bool {
     let nparts = rayon::current_num_threads().max(1);
     let per = urows.len().div_ceil(nparts).max(1);
     const UD_SCHEMA: &str = "message user_daily { required binary user_id (UTF8); required int32 day (DATE); \
-                 required int64 sessions; required int64 events; required int64 revenue_cents; \
+                 required int32 sessions; required int32 events; required int64 revenue_cents; \
                  optional binary top_category (UTF8); }";
+    const UD_DICT: &[&str] = &["day", "sessions", "events", "top_category"];
+    // Integer widths are free: revenue as int32 when every value fits.
+    let rev32 = urows.par_iter().all(|r| r.revenue <= i32::MAX as i64);
+    let ud_schema = if rev32 { UD_SCHEMA.replace("int64 revenue_cents", "int32 revenue_cents") } else { UD_SCHEMA.to_string() };
     rayon::join(
         || {
             urows.par_chunks(per).enumerate().for_each(|(k, rows)| {
@@ -1494,17 +1543,18 @@ fn fast() -> bool {
                     }
                 }
                 let path = ud.join(format!("part-{k}.parquet")).to_string_lossy().to_string();
-                out::write(
+                out::write_dict(
                     &path,
-                    UD_SCHEMA,
+                    &ud_schema,
                     vec![
                         Col::Str(offs.iter().map(|&(o, n)| ByteArray::from(buf.slice(o..o + n))).collect()),
                         Col::I32(rows.iter().map(|r| r.day).collect()),
-                        Col::I64(rows.iter().map(|r| r.sessions).collect()),
-                        Col::I64(rows.iter().map(|r| r.events).collect()),
-                        Col::I64(rows.iter().map(|r| r.revenue).collect()),
+                        Col::I32(rows.iter().map(|r| r.sessions as i32).collect()),
+                        Col::I32(rows.iter().map(|r| r.events as i32).collect()),
+                        if rev32 { Col::I32(rows.iter().map(|r| r.revenue as i32).collect()) } else { Col::I64(rows.iter().map(|r| r.revenue).collect()) },
                         Col::OptStr(top_v, top_d),
                     ],
+                    UD_DICT,
                 );
             });
             if urows.is_empty() {
@@ -1512,7 +1562,7 @@ fn fast() -> bool {
                 out::write(
                     &path,
                     UD_SCHEMA,
-                    vec![Col::Str(vec![]), Col::I32(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::I64(vec![]), Col::OptStr(vec![], vec![])],
+                    vec![Col::Str(vec![]), Col::I32(vec![]), Col::I32(vec![]), Col::I32(vec![]), Col::I64(vec![]), Col::OptStr(vec![], vec![])],
                 );
             }
         },
