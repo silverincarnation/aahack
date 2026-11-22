@@ -92,10 +92,19 @@ fn d36(c: u8) -> u64 {
     }
 }
 
+/// The low 6 bits of each byte, packed: byte i lands at bits 6i..6i+6 (what PEXT with mask
+/// 0x3f3f.. gives, without PEXT, which is microcoded and very slow on some AMD CPUs).
+#[inline(always)]
+fn pack6(y: u64) -> u64 {
+    let a = (y & 0x003f_003f_003f_003f) | ((y & 0x3f00_3f00_3f00_3f00) >> 2);
+    let b = (a & 0x0000_0fff_0000_0fff) | ((a & 0x0fff_0000_0fff_0000) >> 4);
+    (b & 0x00ff_ffff) | ((b >> 8) & 0xffff_ff00_0000)
+}
+
 #[inline(always)]
 fn code(s: &[u8]) -> u64 {
     let n = s.len();
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     if n == 9 && s[0].wrapping_sub(b'a') < 26 {
         unsafe {
             use std::arch::x86_64::*;
@@ -110,14 +119,14 @@ fn code(s: &[u8]) -> u64 {
                     _mm_and_si128(low, _mm_sub_epi8(v, _mm_set1_epi8(0x56))),
                 );
                 let y = (_mm_cvtsi128_si64(val) as u64).swap_bytes();
-                let p = _pext_u64(y, 0x3f3f_3f3f_3f3f_3f3f);
+                let p = pack6(y);
                 return TAG | ((s[0] - b'a') as u64) << 48 | p;
             }
         }
     }
     // 2 to 8 bytes: read the 8 bytes ending at the ID's end. Every caller passes a field of
     // a mapped file whose header line precedes it, so the up to 6 bytes before are readable.
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     if n >= 2 && n <= 8 && s[0].wrapping_sub(b'a') < 26 {
         unsafe {
             use std::arch::x86_64::*;
@@ -134,7 +143,7 @@ fn code(s: &[u8]) -> u64 {
                     _mm_and_si128(low, _mm_sub_epi8(v, _mm_set1_epi8(0x56))),
                 );
                 let y = ((_mm_cvtsi128_si64(val) as u64) & (u64::MAX << (8 * junk))).swap_bytes();
-                let p = _pext_u64(y, 0x3f3f_3f3f_3f3f_3f3f);
+                let p = pack6(y);
                 return TAG | ((s[0] - b'a') as u64) << 48 | (p << (6 * junk));
             }
         }
