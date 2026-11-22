@@ -1113,31 +1113,44 @@ fn fast() -> bool {
         return false;
     }
     // Dedup per partition; survivors scattered by hash(person).
+    let by_p: Vec<std::sync::Mutex<Vec<Vec<Ev>>>> = {
+        let mut v: Vec<Vec<Vec<Ev>>> = (0..NP1).map(|_| Vec::with_capacity(ev_parts.len())).collect();
+        for t in ev_parts {
+            for (p, x) in t.into_iter().enumerate() {
+                v[p].push(x);
+            }
+        }
+        v.into_iter().map(std::sync::Mutex::new).collect()
+    };
     let pev_parts: Vec<Vec<Vec<PEv>>> = par_claim(
             NP1,
-            || (split_into::<PEv>(NP2), Vec::<u32>::new(), Vec::<&Ev>::new()),
+            || (split_into::<PEv>(NP2), Vec::<u32>::new(), Vec::<usize>::new()),
             |st, p| {
                 let (acc, slot, best) = st;
-                let total: usize = ev_parts.iter().map(|t| t[p].len()).sum();
+                // Take this partition's copies; they are freed when it is done, so later
+                // partitions reuse the memory.
+                let srcs: Vec<Vec<Ev>> = std::mem::take(&mut *by_p[p].lock().unwrap());
+                let total: usize = srcs.iter().map(|t| t.len()).sum();
                 let cap = (total * 2).next_power_of_two().max(16);
                 let mask = cap - 1;
                 slot.clear();
                 slot.resize(cap, u32::MAX);
                 best.clear();
-                for t in &ev_parts {
-                    for e in &t[p] {
+                for t in &srcs {
+                    for e in t {
                         let mut i = (h64(e.eid) as usize) & mask;
                         loop {
                             let s = unsafe { *slot.get_unchecked(i) };
                             if s == u32::MAX {
                                 slot[i] = best.len() as u32;
-                                best.push(e);
+                                best.push(e as *const Ev as usize);
                                 break;
                             }
                             let b = &mut best[s as usize];
-                            if b.eid == e.eid {
-                                if e.ingest < b.ingest {
-                                    *b = e;
+                            let bb = unsafe { &*(*b as *const Ev) };
+                            if bb.eid == e.eid {
+                                if e.ingest < bb.ingest {
+                                    *b = e as *const Ev as usize;
                                 }
                                 break;
                             }
@@ -1147,22 +1160,24 @@ fn fast() -> bool {
                 }
                 const PF: usize = 16;
                 for j in 0..best.len() {
-                    if let Some(f) = best.get(j + PF) {
-                        names.prefetch(f.user);
+                    if let Some(&f) = best.get(j + PF) {
+                        names.prefetch(unsafe { (*(f as *const Ev)).user });
                     }
-                    let e = best[j];
+                    let e = unsafe { &*(best[j] as *const Ev) };
                     if e.pc >> 31 == 0 {
                         continue;
                     }
                     let person = names.get(e.user);
                     acc[(h64(person) >> 54) as usize % NP2].push(PEv { person, ts: e.ts, pc: e.pc & 0x7fff_ffff });
                 }
+                best.clear();
+                drop(srcs);
             },
         )
         .into_iter()
         .map(|x| x.0)
         .collect();
-    drop(ev_parts);
+    drop(by_p);
     log("events deduped");
 
     // Clicks.
@@ -1285,7 +1300,22 @@ fn fast() -> bool {
                 for g in 0..np {
                     let person = persons[g];
                     let (ei, ej) = (eoff[g] as usize, eoff[g + 1] as usize);
-                    evs[ei..ej].sort_unstable_by_key(|e| e.ts);
+                    {
+                        let g = &mut evs[ei..ej];
+                        if g.len() <= 24 {
+                            for x in 1..g.len() {
+                                let v = g[x];
+                                let mut y = x;
+                                while y > 0 && g[y - 1].ts > v.ts {
+                                    g[y] = g[y - 1];
+                                    y -= 1;
+                                }
+                                g[y] = v;
+                            }
+                        } else {
+                            g.sort_unstable_by_key(|e| e.ts);
+                        }
+                    }
                     let (c0, c1) = (coff[g] as usize, coff[g + 1] as usize);
                     let cs = &mut cls[c0..c1];
                     cs.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_ids(a.cid, b.cid)));
