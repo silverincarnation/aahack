@@ -68,6 +68,7 @@ pub fn map_file(p: &Path) -> S {
     #[cfg(unix)]
     {
         let _ = m.advise(memmap2::Advice::Sequential);
+        let _ = m.advise(memmap2::Advice::WillNeed);
     }
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
