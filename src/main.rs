@@ -1544,5 +1544,6 @@ fn fast() -> bool {
         },
     );
     log("written");
-    true
+    // Everything is on disk; skip freeing gigabytes of buffers one by one.
+    std::process::exit(0);
 }
