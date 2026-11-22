@@ -94,6 +94,26 @@ fn d36(c: u8) -> u64 {
 #[inline(always)]
 fn code(s: &[u8]) -> u64 {
     let n = s.len();
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2", target_feature = "sse2"))]
+    if n == 9 && s[0].wrapping_sub(b'a') < 26 {
+        unsafe {
+            use std::arch::x86_64::*;
+            let x = std::ptr::read_unaligned(s.as_ptr().add(1) as *const u64);
+            let v = _mm_cvtsi64_si128(x as i64);
+            let dig = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x2f)), _mm_cmplt_epi8(v, _mm_set1_epi8(0x3a)));
+            let low = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x60)), _mm_cmplt_epi8(v, _mm_set1_epi8(0x7b)));
+            let ok = _mm_movemask_epi8(_mm_or_si128(dig, low)) & 0xff;
+            if ok == 0xff {
+                let val = _mm_or_si128(
+                    _mm_and_si128(dig, _mm_sub_epi8(v, _mm_set1_epi8(0x2f))),
+                    _mm_and_si128(low, _mm_sub_epi8(v, _mm_set1_epi8(0x56))),
+                );
+                let y = (_mm_cvtsi128_si64(val) as u64).swap_bytes();
+                let p = _pext_u64(y, 0x3f3f_3f3f_3f3f_3f3f);
+                return TAG | ((s[0] - b'a') as u64) << 48 | p;
+            }
+        }
+    }
     if (2..=9).contains(&n) && s[0].is_ascii_lowercase() {
         let mut v: u64 = 0;
         let mut ok = true;
@@ -278,6 +298,139 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
 }
 
 // ---------------------------------------------------------------------------
+// Timestamps (same verdicts as general::parse_ts, fewer branches)
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn ts_fast(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 20 || n == 25 {
+        let g = |i: usize| unsafe { b.get_unchecked(i).wrapping_sub(b'0') } as u32;
+        let mut bad = 0u32;
+        for &i in &[0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+            bad |= (g(i) > 9) as u32;
+        }
+        bad |= (b[4] != b'-') as u32 | (b[7] != b'-') as u32 | (b[10] != b'T') as u32 | (b[13] != b':') as u32 | (b[16] != b':') as u32;
+        let off: i64 = if n == 20 {
+            bad |= (b[19] != b'Z') as u32;
+            0
+        } else {
+            let sg = match b[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            bad |= (g(20) > 9) as u32 | (g(21) > 9) as u32 | (g(23) > 9) as u32 | (g(24) > 9) as u32 | (b[22] != b':') as u32;
+            let oh = (g(20) * 10 + g(21)) as i64;
+            let om = (g(23) * 10 + g(24)) as i64;
+            bad |= (oh > 23) as u32 | (om > 59) as u32;
+            sg * (oh * 3600 + om * 60) * 1000
+        };
+        if bad != 0 {
+            return None;
+        }
+        let y = (g(0) * 1000 + g(1) * 100 + g(2) * 10 + g(3)) as i64;
+        let mo = (g(5) * 10 + g(6)) as i64;
+        let d = (g(8) * 10 + g(9)) as i64;
+        let h = (g(11) * 10 + g(12)) as i64;
+        let mi = (g(14) * 10 + g(15)) as i64;
+        let se = (g(17) * 10 + g(18)) as i64;
+        if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+            return None;
+        }
+        const DIM: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = DIM[mo as usize] + (mo == 2 && leap) as i64;
+        if d > dim {
+            return None;
+        }
+        let yy = if mo <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let mp = (mo + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        return Some(days * DAY + (h * 3600 + mi * 60 + se) * 1000 - off);
+    }
+    general::parse_ts(b)
+}
+
+fn code_slow(s: &[u8]) -> u64 {
+    let n = s.len();
+    if (2..=9).contains(&n) && s[0].is_ascii_lowercase() {
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for i in 1..9 {
+            let d = if i < n { d36(s[i]) } else { 0 };
+            if i < n && d == 0 {
+                ok = false;
+            }
+            v = (v << 6) | d;
+        }
+        if ok {
+            return TAG | ((s[0] - b'a') as u64) << 48 | v;
+        }
+    }
+    u64::MAX
+}
+
+fn code_selftest() {
+    let al = b"09az/:`{AZ_\x7f\x80\xff";
+    let mut seed: u64 = 99;
+    for _ in 0..5_000_000 {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        let mut b = [0u8; 9];
+        for i in 0..9 {
+            let r = (seed >> (i * 7)) as usize;
+            b[i] = if r % 5 == 0 { al[(r / 5) % al.len()] } else if r % 2 == 0 { b'0' + (r / 2 % 10) as u8 } else { b'a' + (r / 2 % 26) as u8 };
+        }
+        let want = code_slow(&b);
+        if want != u64::MAX {
+            assert_eq!(code(&b), want, "{:?}", b);
+        } else {
+            assert!(code(&b) & TAG == 0, "{:?}", b);
+        }
+    }
+    eprintln!("code selftest ok");
+}
+
+fn ts_selftest() {
+    // Compare with the general parser on many shapes of input.
+    let mut seed: u64 = 0x1234_5678;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let base = ["2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "2028-02-29T00:00:00Z", "2027-02-29T00:00:00Z",
+                "2026-12-31T23:59:59+23:59", "2026-01-01T00:00:00-00:00", "1791071890000", "0001791071890000", "0000-01-01T00:00:00Z"];
+    let alphabet = b"0123456789-T:Z+zt ./e";
+    let mut n = 0u64;
+    for _ in 0..3_000_000 {
+        let mut s: Vec<u8> = base[(rnd() % base.len() as u64) as usize].as_bytes().to_vec();
+        let k = rnd() % 4;
+        for _ in 0..k {
+            let i = (rnd() as usize) % s.len();
+            match rnd() % 3 {
+                0 => s[i] = alphabet[(rnd() as usize) % alphabet.len()],
+                1 => s[i] = b'0' + (rnd() % 10) as u8,
+                _ => {
+                    if rnd() % 2 == 0 { s.remove(i); } else { s.insert(i, b'0' + (rnd() % 10) as u8); }
+                }
+            }
+            if s.is_empty() { s.push(b'1'); }
+        }
+        if ts_fast(&s) != general::parse_ts(&s) {
+            panic!("ts mismatch on {:?}: {:?} vs {:?}", String::from_utf8_lossy(&s), ts_fast(&s), general::parse_ts(&s));
+        }
+        n += 1;
+    }
+    eprintln!("ts selftest ok: {n} cases");
+}
+
+// ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
 
@@ -317,11 +470,12 @@ struct URow {
     top: Option<u8>,
 }
 
-/// Flat table: linked ID -> person name.
+/// Flat table: linked ID -> person name, with a one-bit-per-slot-group filter in front.
 struct Names {
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    slots: Vec<(u64, u64)>,
+    filt: Vec<u64>,
     mask: usize,
+    fmask: usize,
 }
 
 const EMPTY: u64 = u64::MAX >> 1; // never a code: interned numbers stay far below it
@@ -329,16 +483,21 @@ const EMPTY: u64 = u64::MAX >> 1; // never a code: interned numbers stay far bel
 impl Names {
     #[inline(always)]
     fn get(&self, k: u64) -> u64 {
-        if self.keys.is_empty() {
+        if self.slots.is_empty() {
             return k;
         }
-        let mut i = h64(k) as usize & self.mask;
+        let h = h64(k);
+        let fb = (h >> 32) as usize & self.fmask;
+        if unsafe { *self.filt.get_unchecked(fb >> 6) } >> (fb & 63) & 1 == 0 {
+            return k;
+        }
+        let mut i = h as usize & self.mask;
         loop {
-            let x = self.keys[i];
-            if x == k {
-                return self.vals[i];
+            let x = unsafe { *self.slots.get_unchecked(i) };
+            if x.0 == k {
+                return x.1;
             }
-            if x == EMPTY {
+            if x.0 == EMPTY {
                 return k;
             }
             i = (i + 1) & self.mask;
@@ -356,6 +515,7 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 }
 
 fn build_names(chs: &[S]) -> Names {
+    use std::sync::atomic::AtomicU64;
     let pairs: Vec<(u64, u64)> = chs
         .par_iter()
         .flat_map_iter(|&ch| {
@@ -369,15 +529,34 @@ fn build_names(chs: &[S]) -> Names {
         })
         .collect();
     if pairs.is_empty() {
-        return Names { keys: vec![], vals: vec![], mask: 0 };
+        return Names { slots: vec![], filt: vec![], mask: 0, fmask: 0 };
     }
-    let mut ids: Vec<u64> = pairs.par_iter().flat_map_iter(|&(a, b)| [a, b]).collect();
-    ids.par_sort_unstable();
-    ids.dedup();
-    let n = ids.len();
-    let gid = |k: u64| ids.binary_search(&k).unwrap() as u32;
-    let edges: Vec<(u32, u32)> = pairs.par_iter().map(|&(a, b)| (gid(a), gid(b))).collect();
-    let mut parent: Vec<u32> = (0..n as u32).collect();
+    // Concurrent open addressing; an ID's slot index is its node number.
+    let cap = (pairs.len() * 4).next_power_of_two().max(16);
+    let mask = cap - 1;
+    let keys: Vec<AtomicU64> = (0..cap).into_par_iter().map(|_| AtomicU64::new(EMPTY)).collect();
+    let slot = |k: u64| -> u32 {
+        let mut i = h64(k) as usize & mask;
+        loop {
+            let cur = keys[i].load(Ordering::Relaxed);
+            if cur == k {
+                return i as u32;
+            }
+            if cur == EMPTY {
+                match keys[i].compare_exchange(EMPTY, k, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => return i as u32,
+                    Err(c) if c == k => return i as u32,
+                    Err(_) => {}
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    };
+    let edges: Vec<(u32, u32)> = pairs.par_iter().map(|&(a, b)| (slot(a), slot(b))).collect();
+    drop(pairs);
+    let keys: Vec<u64> = keys.into_iter().map(|a| a.into_inner()).collect();
+    log("links: slots");
+    let mut parent: Vec<u32> = (0..cap as u32).collect();
     for &(a, b) in &edges {
         let ra = find(&mut parent, a);
         let rb = find(&mut parent, b);
@@ -385,32 +564,81 @@ fn build_names(chs: &[S]) -> Names {
             if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
         }
     }
+    log("links: uf");
     // Name = byte-wise smallest ID of the component. Codes of generator-shaped IDs sort
     // like their bytes; only interned IDs need a byte comparison.
-    let mut best: Vec<u64> = vec![EMPTY; n];
-    for g in 0..n as u32 {
-        let r = find(&mut parent, g) as usize;
-        parent[g as usize] = r as u32;
-        let k = ids[g as usize];
+    let mut best: Vec<u64> = vec![EMPTY; cap];
+    let mut n = 0usize;
+    for g in 0..cap {
+        let k = keys[g];
+        if k == EMPTY {
+            continue;
+        }
+        n += 1;
+        let r = find(&mut parent, g as u32) as usize;
+        parent[g] = r as u32;
         if best[r] == EMPTY || cmp_ids(k, best[r]) == std::cmp::Ordering::Less {
             best[r] = k;
         }
     }
-    let cap = (n * 2).next_power_of_two().max(16);
-    let mask = cap - 1;
-    let mut keys = vec![EMPTY; cap];
-    let mut vals = vec![0u64; cap];
-    for g in 0..n {
-        let k = ids[g];
-        let mut i = h64(k) as usize & mask;
-        while keys[i] != EMPTY {
-            i = (i + 1) & mask;
-        }
-        keys[i] = k;
-        vals[i] = best[parent[g] as usize];
-    }
+    let fbits = (n * 16).next_power_of_two().max(64);
+    let fmask = fbits - 1;
+    let filt: Vec<AtomicU64> = (0..fbits / 64).into_par_iter().map(|_| AtomicU64::new(0)).collect();
+    let slots: Vec<(u64, u64)> = (0..cap)
+        .into_par_iter()
+        .map(|g| {
+            let k = keys[g];
+            if k == EMPTY {
+                (EMPTY, 0)
+            } else {
+                let fb = (h64(k) >> 32) as usize & fmask;
+                filt[fb >> 6].fetch_or(1 << (fb & 63), Ordering::Relaxed);
+                (k, best[parent[g] as usize])
+            }
+        })
+        .collect();
+    let filt: Vec<u64> = filt.into_iter().map(|a| a.into_inner()).collect();
     log(&format!("links: {} ids, {} edges", n, edges.len()));
-    Names { keys, vals, mask }
+    Names { slots, filt, mask, fmask }
+}
+
+/// Scatter into partitions through small per-partition staging buffers, so each partition
+/// is written a few cache lines at a time.
+struct Wc<T: Copy, const B: usize> {
+    parts: Vec<Vec<T>>,
+    buf: Vec<[T; B]>,
+    cnt: Vec<u8>,
+}
+
+impl<T: Copy, const B: usize> Wc<T, B> {
+    fn new(np: usize, cap: usize) -> Self {
+        Wc {
+            parts: (0..np).map(|_| Vec::with_capacity(cap)).collect(),
+            buf: vec![unsafe { std::mem::zeroed() }; np],
+            cnt: vec![0; np],
+        }
+    }
+    #[inline(always)]
+    fn push(&mut self, p: usize, x: T) {
+        unsafe {
+            let c = self.cnt.get_unchecked_mut(p);
+            let b = self.buf.get_unchecked_mut(p);
+            *b.get_unchecked_mut(*c as usize) = x;
+            *c += 1;
+            if *c as usize == B {
+                *c = 0;
+                self.parts.get_unchecked_mut(p).extend_from_slice(b);
+            }
+        }
+    }
+    fn finish(mut self) -> Vec<Vec<T>> {
+        for p in 0..self.parts.len() {
+            let c = self.cnt[p] as usize;
+            let b = self.buf[p];
+            self.parts[p].extend_from_slice(&b[..c]);
+        }
+        self.parts
+    }
 }
 
 fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
@@ -428,6 +656,11 @@ fn main() {
         if n > 0 {
             rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
         }
+    }
+    if std::env::var("TS_SELFTEST").is_ok() {
+        ts_selftest();
+        code_selftest();
+        return;
     }
     if std::env::var("FORCE_GENERAL").is_ok() || !fast() {
         log("running the general implementation");
@@ -520,31 +753,25 @@ fn fast() -> bool {
         return false;
     }
 
-    let names = build_names(&ln_chunks);
-    if FALLBACK.load(Ordering::Relaxed) {
-        return false;
-    }
 
-    // Events: every copy, scattered by hash(event_id).
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.len()).sum();
     let nfold = (ev_chunks.len() / general::min_len(ev_chunks.len())).max(1);
     let ev_cap = ev_bytes / 80 / nfold / NP1 * 5 / 4 + 16;
-    let ev_parts: Vec<Vec<Vec<Ev>>> = ev_chunks
+    // Events: every copy, scattered by hash(event_id).
+    let parse_events = || -> Vec<Vec<Vec<Ev>>> {
+    let r = ev_chunks
         .par_iter()
         .with_min_len(general::min_len(ev_chunks.len()))
         .fold(
-            || {
-                let cap = ev_cap;
-                (0..NP1).map(|_| Vec::with_capacity(cap)).collect::<Vec<Vec<Ev>>>()
-            },
+            || Wc::<Ev, 4>::new(NP1, ev_cap),
             |mut acc, &ch| {
                 scan::<7>(ch, |f| {
                     let eid = f[0];
                     if eid.is_empty() {
                         return;
                     }
-                    let ingest = general::parse_ts(f[3]).unwrap_or(i64::MAX);
-                    let ts = general::parse_ts(f[2]);
+                    let ingest = ts_fast(f[3]).unwrap_or(i64::MAX);
+                    let ts = ts_fast(f[2]);
                     let mut valid = !f[1].is_empty() && !f[5].is_empty();
                     let mut pc = 0u32;
                     let tsv = ts.unwrap_or(i64::MIN);
@@ -572,17 +799,57 @@ fn fast() -> bool {
                         ts: if valid { (tsv - ws) as u32 } else { 0 },
                         pc: pc | ((valid as u32) << 31),
                     };
-                    acc[(h64(k) >> 54) as usize % NP1].push(e);
+                    acc.push((h64(k) >> 54) as usize % NP1, e);
                 });
                 acc
             },
         )
+        .map(|w| w.finish())
         .collect();
+    log("events parsed");
+    r
+    };
+
+    let parse_clicks = |names: &Names| -> Vec<Vec<Vec<PCl>>> {
+    let r = cl_chunks
+        .par_iter()
+        .with_min_len(general::min_len(cl_chunks.len()))
+        .fold(
+            || Wc::<PCl, 8>::new(NP2, 0),
+            |mut acc, &ch| {
+                scan::<4>(ch, |f| {
+                    let (cid, user) = (f[0], f[1]);
+                    if cid.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let ts = match ts_fast(f[3]) {
+                        Some(t) if t >= lo_click && t < we => t,
+                        _ => return,
+                    };
+                    if f[2].len() > 15 {
+                        return; // not a campaign (all campaign ids are packable)
+                    }
+                    let c = match camp.get(&pack(f[2])) {
+                        Some(&c) => c,
+                        None => return,
+                    };
+                    let person = names.get(code(user));
+                    let cid = code(cid);
+                    acc.push((h64(person) >> 54) as usize % NP2, PCl { person, cid, ts: (ts - lo_click) as u32, camp: c });
+                });
+                acc
+            },
+        )
+        .map(|w| w.finish()).collect();
+    log("clicks parsed");
+    r
+    };
+    let names = build_names(&ln_chunks);
+    let ev_parts = parse_events();
+    let pcl_parts = parse_clicks(&names);
     if FALLBACK.load(Ordering::Relaxed) {
         return false;
     }
-    log("events parsed");
-
     // Dedup per partition; survivors scattered by hash(person).
     let pev_parts: Vec<Vec<Vec<PEv>>> = (0..NP1)
         .into_par_iter()
@@ -631,40 +898,6 @@ fn fast() -> bool {
     log("events deduped");
 
     // Clicks.
-    let pcl_parts: Vec<Vec<Vec<PCl>>> = cl_chunks
-        .par_iter()
-        .with_min_len(general::min_len(cl_chunks.len()))
-        .fold(
-            || split_into::<PCl>(NP2),
-            |mut acc, &ch| {
-                scan::<4>(ch, |f| {
-                    let (cid, user) = (f[0], f[1]);
-                    if cid.is_empty() || user.is_empty() {
-                        return;
-                    }
-                    let ts = match general::parse_ts(f[3]) {
-                        Some(t) if t >= lo_click && t < we => t,
-                        _ => return,
-                    };
-                    if f[2].len() > 15 {
-                        return; // not a campaign (all campaign ids are packable)
-                    }
-                    let c = match camp.get(&pack(f[2])) {
-                        Some(&c) => c,
-                        None => return,
-                    };
-                    let person = names.get(code(user));
-                    let cid = code(cid);
-                    acc[(h64(person) >> 54) as usize % NP2].push(PCl { person, cid, ts: (ts - lo_click) as u32, camp: c });
-                });
-                acc
-            },
-        )
-        .collect();
-    if FALLBACK.load(Ordering::Relaxed) {
-        return false;
-    }
-    log("clicks parsed");
 
     // Per person partition.
     let ncell = ncamp * nd;
