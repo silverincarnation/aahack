@@ -16,8 +16,6 @@
 
 mod general;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -949,7 +947,7 @@ fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
 
 // DIAGNOSTIC BUILD: after the output is written, sleep so that the scored
 // runtime encodes facts about the scoring machine. 1 = internal time, 2 = machine.
-const DIAG: u8 = 4;
+const DIAG: u8 = 0;
 
 static mut DIAG_TOUCH: f64 = 0.0;
 static mut DIAG_PARSED: f64 = 0.0;
