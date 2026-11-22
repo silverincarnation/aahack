@@ -73,19 +73,100 @@ fn pack(s: &[u8]) -> u128 {
     u128::from_be_bytes(b)
 }
 
-fn unpack(k: u128) -> Vec<u8> {
-    let b = k.to_be_bytes();
-    b[..b[15] as usize].to_vec()
+/// 64-bit ID codes. The generator's IDs are a lowercase letter and 1 to 8 base-36 digits;
+/// those get an order-preserving code (bit 63 set, letter in 5 bits, then 8 six-bit slots
+/// holding digit + 1, 0 for none), so equal codes <=> equal strings and code order is byte
+/// order. Any other ID is interned and gets a sequence number (bit 63 clear); comparing
+/// those for order goes through the bytes.
+const TAG: u64 = 1 << 63;
+
+static INTERN: std::sync::Mutex<Option<(hashbrown::HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>> = std::sync::Mutex::new(None);
+
+#[inline(always)]
+fn d36(c: u8) -> u64 {
+    match c {
+        b'0'..=b'9' => (c - b'0') as u64 + 1,
+        b'a'..=b'z' => (c - b'a') as u64 + 11,
+        _ => 0,
+    }
 }
 
 #[inline(always)]
-fn hk(k: u128) -> u64 {
-    let mut x = (k as u64) ^ ((k >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    x ^= x >> 31;
+fn code(s: &[u8]) -> u64 {
+    let n = s.len();
+    if (2..=9).contains(&n) && s[0].is_ascii_lowercase() {
+        let mut v: u64 = 0;
+        let mut ok = true;
+        for i in 1..9 {
+            let d = if i < n { d36(s[i]) } else { 0 };
+            if i < n && d == 0 {
+                ok = false;
+            }
+            v = (v << 6) | d;
+        }
+        if ok {
+            return TAG | ((s[0] - b'a') as u64) << 48 | v;
+        }
+    }
+    intern(s)
+}
+
+#[cold]
+fn intern(s: &[u8]) -> u64 {
+    let mut g = INTERN.lock().unwrap();
+    let (m, v) = g.get_or_insert_with(|| (hashbrown::HashMap::new(), Vec::new()));
+    if let Some(&c) = m.get(s) {
+        return c;
+    }
+    let c = v.len() as u64;
+    v.push(s.to_vec());
+    m.insert(s.to_vec(), c);
+    c
+}
+
+fn decode_into(c: u64, buf: &mut Vec<u8>) {
+    if c & TAG != 0 {
+        buf.push(b'a' + ((c >> 48) & 31) as u8);
+        for i in (0..8).rev() {
+            let d = (c >> (6 * i)) & 63;
+            if d == 0 {
+                break;
+            }
+            buf.push(if d <= 10 { b'0' + (d - 1) as u8 } else { b'a' + (d - 11) as u8 });
+        }
+    } else {
+        let g = INTERN.lock().unwrap();
+        buf.extend_from_slice(&g.as_ref().unwrap().1[c as usize]);
+    }
+}
+
+fn decode(c: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9);
+    decode_into(c, &mut v);
+    v
+}
+
+/// Byte-wise order of the IDs behind two codes.
+#[inline]
+fn cmp_ids(a: u64, b: u64) -> std::cmp::Ordering {
+    if a & b & TAG != 0 {
+        a.cmp(&b)
+    } else if a == b {
+        std::cmp::Ordering::Equal
+    } else {
+        decode(a).cmp(&decode(b))
+    }
+}
+
+#[inline(always)]
+fn h64(k: u64) -> u64 {
+    let mut x = k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 29;
     x = x.wrapping_mul(0xD6E8_FEB8_6659_FD93);
     x ^= x >> 32;
     x
 }
+
 
 // ---------------------------------------------------------------------------
 // CSV scanning
@@ -203,8 +284,8 @@ fn scan<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Ev {
-    eid: u128,
-    user: u128,
+    eid: u64,
+    user: u64,
     ingest: i64,
     ts: u32,   // ms since window start
     pc: u32,   // price (24 bits) | cat << 24 (7 bits) | valid << 31
@@ -213,7 +294,7 @@ struct Ev {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PEv {
-    person: u128,
+    person: u64,
     ts: u32,
     pc: u32,
 }
@@ -221,14 +302,14 @@ struct PEv {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PCl {
-    person: u128,
-    cid: u128,
+    person: u64,
+    cid: u64,
     ts: u32, // ms since window start - 7 days
     camp: u32,
 }
 
 struct URow {
-    name: u128,
+    name: u64,
     day: i32,
     sessions: i64,
     events: i64,
@@ -238,24 +319,26 @@ struct URow {
 
 /// Flat table: linked ID -> person name.
 struct Names {
-    keys: Vec<u128>,
-    vals: Vec<u128>,
+    keys: Vec<u64>,
+    vals: Vec<u64>,
     mask: usize,
 }
 
+const EMPTY: u64 = u64::MAX >> 1; // never a code: interned numbers stay far below it
+
 impl Names {
     #[inline(always)]
-    fn get(&self, k: u128) -> u128 {
+    fn get(&self, k: u64) -> u64 {
         if self.keys.is_empty() {
             return k;
         }
-        let mut i = hk(k) as usize & self.mask;
+        let mut i = h64(k) as usize & self.mask;
         loop {
             let x = self.keys[i];
             if x == k {
                 return self.vals[i];
             }
-            if x == 0 {
+            if x == EMPTY {
                 return k;
             }
             i = (i + 1) & self.mask;
@@ -273,13 +356,13 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
 }
 
 fn build_names(chs: &[S]) -> Names {
-    let pairs: Vec<(u128, u128)> = chs
+    let pairs: Vec<(u64, u64)> = chs
         .par_iter()
         .flat_map_iter(|&ch| {
             let mut v = Vec::new();
             scan::<2>(ch, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((pack(f[0]), pack(f[1])));
+                    v.push((code(f[0]), code(f[1])));
                 }
             });
             v
@@ -288,37 +371,43 @@ fn build_names(chs: &[S]) -> Names {
     if pairs.is_empty() {
         return Names { keys: vec![], vals: vec![], mask: 0 };
     }
-    let mut ids: Vec<u128> = pairs.par_iter().flat_map_iter(|&(a, b)| [a, b]).collect();
+    let mut ids: Vec<u64> = pairs.par_iter().flat_map_iter(|&(a, b)| [a, b]).collect();
     ids.par_sort_unstable();
     ids.dedup();
     let n = ids.len();
-    let gid = |k: u128| ids.binary_search(&k).unwrap() as u32;
+    let gid = |k: u64| ids.binary_search(&k).unwrap() as u32;
     let edges: Vec<(u32, u32)> = pairs.par_iter().map(|&(a, b)| (gid(a), gid(b))).collect();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     for &(a, b) in &edges {
         let ra = find(&mut parent, a);
         let rb = find(&mut parent, b);
         if ra != rb {
-            // smallest index = byte-wise smallest ID stays the root
             if ra < rb { parent[rb as usize] = ra } else { parent[ra as usize] = rb }
         }
     }
+    // Name = byte-wise smallest ID of the component. Codes of generator-shaped IDs sort
+    // like their bytes; only interned IDs need a byte comparison.
+    let mut best: Vec<u64> = vec![EMPTY; n];
     for g in 0..n as u32 {
-        let r = find(&mut parent, g);
-        parent[g as usize] = r;
+        let r = find(&mut parent, g) as usize;
+        parent[g as usize] = r as u32;
+        let k = ids[g as usize];
+        if best[r] == EMPTY || cmp_ids(k, best[r]) == std::cmp::Ordering::Less {
+            best[r] = k;
+        }
     }
     let cap = (n * 2).next_power_of_two().max(16);
     let mask = cap - 1;
-    let mut keys = vec![0u128; cap];
-    let mut vals = vec![0u128; cap];
+    let mut keys = vec![EMPTY; cap];
+    let mut vals = vec![0u64; cap];
     for g in 0..n {
         let k = ids[g];
-        let mut i = hk(k) as usize & mask;
-        while keys[i] != 0 {
+        let mut i = h64(k) as usize & mask;
+        while keys[i] != EMPTY {
             i = (i + 1) & mask;
         }
         keys[i] = k;
-        vals[i] = ids[parent[g] as usize];
+        vals[i] = best[parent[g] as usize];
     }
     log(&format!("links: {} ids, {} edges", n, edges.len()));
     Names { keys, vals, mask }
@@ -382,7 +471,7 @@ fn fast() -> bool {
     // Products and campaigns.
     let mut cat_names: Vec<S> = Vec::new();
     let mut cat_idx: HashMap<S, u8> = HashMap::new();
-    let mut prod: HashMap<u128, u8> = HashMap::new();
+    let mut prod: hashbrown::HashMap<u128, u8> = hashbrown::HashMap::new();
     let mut long_prod = false;
     for ch in general::chunks(&[general::map_file(&data.join("products.csv"))], usize::MAX) {
         general::for_each_record::<2>(ch, |f| {
@@ -414,7 +503,7 @@ fn fast() -> bool {
     }
     let mut camp_names: Vec<S> = Vec::new();
     let mut camp_chan: Vec<S> = Vec::new();
-    let mut camp: HashMap<u128, u32> = HashMap::new();
+    let mut camp: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
     for ch in general::chunks(&[general::map_file(&data.join("campaigns.csv"))], usize::MAX) {
         general::for_each_record::<2>(ch, |f| {
             let k = pack(f[0]);
@@ -454,10 +543,6 @@ fn fast() -> bool {
                     if eid.is_empty() {
                         return;
                     }
-                    if eid.len() > 15 || f[1].len() > 15 {
-                        bail("long id");
-                        return;
-                    }
                     let ingest = general::parse_ts(f[3]).unwrap_or(i64::MAX);
                     let ts = general::parse_ts(f[2]);
                     let mut valid = !f[1].is_empty() && !f[5].is_empty();
@@ -479,15 +564,15 @@ fn fast() -> bool {
                             _ => valid = false,
                         }
                     }
-                    let k = pack(eid);
+                    let k = code(eid);
                     let e = Ev {
                         eid: k,
-                        user: if f[1].is_empty() { 0 } else { pack(f[1]) },
+                        user: if f[1].is_empty() { EMPTY } else { code(f[1]) },
                         ingest,
                         ts: if valid { (tsv - ws) as u32 } else { 0 },
                         pc: pc | ((valid as u32) << 31),
                     };
-                    acc[(hk(k) >> 54) as usize % NP1].push(e);
+                    acc[(h64(k) >> 54) as usize % NP1].push(e);
                 });
                 acc
             },
@@ -512,7 +597,7 @@ fn fast() -> bool {
                 let mut best: Vec<Ev> = Vec::with_capacity(total);
                 for t in &ev_parts {
                     for e in &t[p] {
-                        let mut i = (hk(e.eid) as usize) & mask;
+                        let mut i = (h64(e.eid) as usize) & mask;
                         loop {
                             let s = slot[i];
                             if s == u32::MAX {
@@ -536,7 +621,7 @@ fn fast() -> bool {
                         continue;
                     }
                     let person = names.get(e.user);
-                    acc[(hk(person) >> 54) as usize % NP2].push(PEv { person, ts: e.ts, pc: e.pc & 0x7fff_ffff });
+                    acc[(h64(person) >> 54) as usize % NP2].push(PEv { person, ts: e.ts, pc: e.pc & 0x7fff_ffff });
                 }
                 acc
             },
@@ -568,9 +653,9 @@ fn fast() -> bool {
                         Some(&c) => c,
                         None => return,
                     };
-                    let person = names.get(pack(user));
-                    let cid = pack(cid);
-                    acc[(hk(person) >> 54) as usize % NP2].push(PCl { person, cid, ts: (ts - lo_click) as u32, camp: c });
+                    let person = names.get(code(user));
+                    let cid = code(cid);
+                    acc[(h64(person) >> 54) as usize % NP2].push(PCl { person, cid, ts: (ts - lo_click) as u32, camp: c });
                 });
                 acc
             },
@@ -603,7 +688,7 @@ fn fast() -> bool {
                     cls.extend_from_slice(&t[b]);
                 }
                 evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-                cls.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then(a.cid.cmp(&b.cid)));
+                cls.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| cmp_ids(a.cid, b.cid)));
                 cls.dedup_by(|a, b| a.person == b.person && a.cid == b.cid && a.ts == b.ts);
 
                 let mut ci = 0usize;
@@ -772,10 +857,9 @@ fn fast() -> bool {
                 let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 10);
                 let mut offs: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
                 for r in rows {
-                    let b = r.name.to_be_bytes();
-                    let n = b[15] as usize;
-                    offs.push((buf.len(), n));
-                    buf.extend_from_slice(&b[..n]);
+                    let o = buf.len();
+                    decode_into(r.name, &mut buf);
+                    offs.push((o, buf.len() - o));
                 }
                 let buf = bytes::Bytes::from(buf);
                 let mut top_v = Vec::new();
@@ -840,6 +924,5 @@ fn fast() -> bool {
         },
     );
     log("written");
-    let _ = unpack;
     true
 }

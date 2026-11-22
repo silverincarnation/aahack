@@ -244,7 +244,7 @@ con.execute(f"""
 CREATE TABLE ev_s AS
 SELECT person, ts, price, product_id,
        sum(CASE WHEN prev IS NULL OR ts - prev > {GAP} THEN 1 ELSE 0 END)
-           OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING) AS sid
+           OVER (PARTITION BY person ORDER BY ts RANGE UNBOUNDED PRECEDING) AS sid
 FROM (SELECT *, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS prev FROM ev)
 """)
 con.execute("DROP TABLE ev")
