@@ -166,8 +166,11 @@ fn code(s: &[u8]) -> u64 {
     intern(s)
 }
 
+static INTERN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cold]
 fn intern(s: &[u8]) -> u64 {
+    INTERN_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut g = INTERN.lock().unwrap();
     let (m, v) = g.get_or_insert_with(|| (hashbrown::HashMap::new(), Vec::new()));
     if let Some(&c) = m.get(s) {
@@ -950,7 +953,7 @@ fn split_into<T: Copy>(parts: usize) -> Vec<Vec<T>> {
 
 // DIAGNOSTIC BUILD: after the output is written, sleep so that the scored
 // runtime encodes facts about the scoring machine. 1 = internal time, 2 = machine.
-const DIAG: u8 = 5;
+const DIAG: u8 = 6;
 
 static mut DIAG_TOUCH: f64 = 0.0;
 static mut DIAG_PARSED: f64 = 0.0;
@@ -1079,6 +1082,14 @@ fn diag_sleep(general_path: bool) {
             let qa = (a / 0.25).round().min(8.0);
             let qb = (b / 0.25).round().min(9.0);
             30.0 * qa + 3.0 * qb
+        }
+        6 => {
+            let calls = INTERN_CALLS.load(Ordering::Relaxed) as f64;
+            let uniq = INTERN.lock().unwrap().as_ref().map(|x| x.1.len()).unwrap_or(0) as f64;
+            log(&format!("diag6 intern calls {calls} unique {uniq}"));
+            let a = (calls + 1.0).log10().round().min(8.0);
+            let b = (uniq + 1.0).log10().round().min(8.0);
+            20.0 * a + 2.0 * b
         }
         _ => 0.0,
     };
