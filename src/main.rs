@@ -680,6 +680,19 @@ const EMPTY: u64 = u64::MAX >> 1; // never a code: interned numbers stay far bel
 
 impl Names {
     #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let h = h64(k);
+        let fb = (h >> 32) as usize & self.fmask;
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.filt.as_ptr().add(fb >> 6) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(h as usize & self.mask) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
     fn get(&self, k: u64) -> u64 {
         if self.slots.is_empty() {
             return k;
@@ -1016,6 +1029,15 @@ fn fast() -> bool {
         .fold(
             || Wc::<PCl, 8>::new(NP2, 0),
             |mut acc, &ch| {
+                // Ring of clicks waiting for their person lookup, so the table line is
+                // prefetched a few clicks ahead.
+                const R: usize = 16;
+                let mut ring = [PCl { person: 0, cid: 0, ts: 0, camp: 0 }; R];
+                let mut rn = 0usize;
+                let emit = |acc: &mut Wc<PCl, 8>, mut c: PCl| {
+                    c.person = names.get(c.person);
+                    acc.push((h64(c.person) >> 54) as usize % NP2, c);
+                };
                 scan::<4>(ch, |f| {
                     let (cid, user) = (f[0], f[1]);
                     if cid.is_empty() || user.is_empty() {
@@ -1032,10 +1054,18 @@ fn fast() -> bool {
                         Some(&c) => c,
                         None => return,
                     };
-                    let person = names.get(code(user));
-                    let cid = code(cid);
-                    acc.push((h64(person) >> 54) as usize % NP2, PCl { person, cid, ts: (ts - lo_click) as u32, camp: c });
+                    let u = code(user);
+                    names.prefetch(u);
+                    let slot = &mut ring[rn % R];
+                    if rn >= R {
+                        emit(&mut acc, *slot);
+                    }
+                    *slot = PCl { person: u, cid: code(cid), ts: (ts - lo_click) as u32, camp: c };
+                    rn += 1;
                 });
+                for k in rn.saturating_sub(R)..rn {
+                    emit(&mut acc, ring[k % R]);
+                }
                 acc
             },
         )
@@ -1082,7 +1112,11 @@ fn fast() -> bool {
                         }
                     }
                 }
-                for e in &best {
+                const PF: usize = 16;
+                for (j, e) in best.iter().enumerate() {
+                    if let Some(f) = best.get(j + PF) {
+                        names.prefetch(f.user);
+                    }
                     if e.pc >> 31 == 0 {
                         continue;
                     }
